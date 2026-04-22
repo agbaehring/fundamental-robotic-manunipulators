@@ -4,21 +4,26 @@ import json
 import datetime
 import time
 
+DISPLAY_WIDTH = 1024
+DISPLAY_HEIGHT = 600
+PANEL_WIDTH = 300
+
+EXIT_BTN = (20, 20, 120, 50)
+exit_requested = False
+
 RESULTS_FILE = "results_log.json"
 SAVE_FILE = "rois.json"
 
 last_saved_results = None
 freeze_until = 0
 
-# pin out setup for 8 outputs (GPIO 17, 18, 27, 22, 23, 24, 25, 5)
+# --- GPIO setup ---
 try:
     import RPi.GPIO as GPIO
     GPIO.setmode(GPIO.BCM)
     REAL_GPIO = True
-    print("Running on Raspberry Pi (real GPIO)")
 except ImportError:
     REAL_GPIO = False
-    print("Running on Windows (GPIO emulated)")
 
     class FakeGPIO:
         BCM = "BCM"
@@ -26,18 +31,10 @@ except ImportError:
         HIGH = 1
         LOW = 0
 
-        def setmode(self, mode):
-            pass
-
-        def setup(self, pin, mode):
-            print(f"[GPIO SETUP] Pin {pin}")
-
-        def output(self, pin, value):
-            state = "HIGH" if value else "LOW"
-            print(f"[GPIO OUTPUT] Pin {pin} -> {state}")
-
-        def cleanup(self):
-            print("[GPIO CLEANUP]")
+        def setmode(self, mode): pass
+        def setup(self, pin, mode): pass
+        def output(self, pin, value): pass
+        def cleanup(self): pass
 
     GPIO = FakeGPIO()
 
@@ -47,20 +44,18 @@ for pin in GPIO_PINS:
     GPIO.setup(pin, GPIO.OUT)
     GPIO.output(pin, GPIO.LOW)
 
-#function to update GPIO outputs based on results
 def update_gpio_outputs(results):
     for i, res in enumerate(results):
-        if i >= len(GPIO_PINS):
-            break
-
         if res == "GOOD":
             GPIO.output(GPIO_PINS[i], GPIO.HIGH)
         else:
             GPIO.output(GPIO_PINS[i], GPIO.LOW)
 
-# --- Camera setup ---
+# --- Camera ---
 def open_camera(index):
     cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     return cap
 
 camera_index = 0
@@ -74,191 +69,157 @@ ix, iy = -1, -1
 def classify_color(roi_img):
     hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
 
-    blue_mask = cv2.inRange(hsv, (100, 100, 50), (130, 255, 255))
+    blue = cv2.inRange(hsv, (100,100,50),(130,255,255))
+    red1 = cv2.inRange(hsv, (0,100,50),(10,255,255))
+    red2 = cv2.inRange(hsv, (170,100,50),(180,255,255))
 
-    red_mask1 = cv2.inRange(hsv, (0, 100, 50), (10, 255, 255))
-    red_mask2 = cv2.inRange(hsv, (170, 100, 50), (180, 255, 255))
-    red_mask = red_mask1 + red_mask2
-
-    blue_pixels = cv2.countNonZero(blue_mask)
-    red_pixels = cv2.countNonZero(red_mask)
-
-    return "GOOD" if blue_pixels > red_pixels else "BAD"
+    return "GOOD" if cv2.countNonZero(blue) > cv2.countNonZero(red1+red2) else "BAD"
 
 def save_results(results):
     global last_saved_results, freeze_until
 
-    data = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "results": results
-    }
+    data = {"timestamp": datetime.datetime.now().isoformat(),"results": results}
 
     try:
-        with open(RESULTS_FILE, "r") as f:
-            existing = json.load(f)
+        existing = json.load(open(RESULTS_FILE))
     except:
         existing = []
 
     existing.append(data)
-
-    with open(RESULTS_FILE, "w") as f:
-        json.dump(existing, f, indent=2)
+    json.dump(existing, open(RESULTS_FILE,"w"), indent=2)
 
     last_saved_results = results.copy()
+    update_gpio_outputs(results)
+    freeze_until = time.time()+1
 
-    update_gpio_outputs(results)  # 🔥 THIS LINE
-
-    freeze_until = time.time() + 1.0
-
-def draw_rois(frame):
+def draw_rois(display_frame, original_frame):
     results = []
+
+    scale_x = (DISPLAY_WIDTH - PANEL_WIDTH) / 1920
+    scale_y = DISPLAY_HEIGHT / 1080
+
     for i, (x, y, w, h) in enumerate(rois):
-        roi = frame[y:y+h, x:x+w]
+
+        # --- Use original frame for detection ---
+        roi = original_frame[y:y+h, x:x+w]
         if roi.size == 0:
             continue
 
         result = classify_color(roi)
         results.append(result)
 
+        # --- Scale for drawing ---
+        dx = int(x * scale_x)
+        dy = int(y * scale_y)
+        dw = int(w * scale_x)
+        dh = int(h * scale_y)
+
         color = (255, 0, 0) if result == "GOOD" else (0, 0, 255)
 
-        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-        cv2.putText(frame, f"{i}:{result}", (x, y-5),
+        cv2.rectangle(display_frame, (dx, dy), (dx+dw, dy+dh), color, 2)
+        cv2.putText(display_frame, f"{i}:{result}", (dx, dy-5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-    return results
+    return results  
 
-def draw_status_panel(frame, current_results):
-    h, w, _ = frame.shape
-    panel = np.zeros((h, 300, 3), dtype=np.uint8)
+def draw_status_panel(frame,results):
+    h,_=frame.shape[:2]
+    panel=np.zeros((h,PANEL_WIDTH,3),dtype=np.uint8)
 
-    # CURRENT
-    cv2.putText(panel, "CURRENT", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    cv2.putText(panel,"CURRENT",(10,30),0,0.7,(255,255,255),2)
+    for i,r in enumerate(results):
+        c=(255,0,0) if r=="GOOD" else (0,0,255)
+        cv2.putText(panel,f"{i}:{r}",(10,60+i*25),0,0.6,c,2)
 
-    for i, res in enumerate(current_results):
-        color = (255, 0, 0) if res == "GOOD" else (0, 0, 255)
-        cv2.putText(panel, f"{i}: {res}", (10, 60 + i*25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    # SAVED
-    cv2.putText(panel, "SAVED", (10, 270),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    cv2.putText(panel,"SAVED",(10,270),0,0.7,(255,255,255),2)
 
     if last_saved_results:
-        for i, res in enumerate(last_saved_results):
-            color = (255, 0, 0) if res == "GOOD" else (0, 0, 255)
-            cv2.putText(panel, f"{i}: {res}", (10, 300 + i*25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    else:
-        cv2.putText(panel, "None", (10, 330),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+        for i,r in enumerate(last_saved_results):
+            c=(255,0,0) if r=="GOOD" else (0,0,255)
+            cv2.putText(panel,f"{i}:{r}",(10,300+i*25),0,0.6,c,2)
 
-    return np.hstack((frame, panel))
+    return np.hstack((frame,panel))
 
-def draw_pass_fail(frame, results):
-    if len(results) != 8:
-        return frame
-
-    all_good = all(r == "GOOD" for r in results)
-
-    text = "PASS" if all_good else "FAIL"
-    color = (0, 255, 0) if all_good else (0, 0, 255)
-
-    cv2.putText(frame, text, (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 2, color, 4)
-
+def draw_pass_fail(frame,results):
+    if len(results)!=8: return frame
+    good=all(r=="GOOD" for r in results)
+    cv2.putText(frame,"PASS" if good else "FAIL",(20,60),0,2,(0,255,0) if good else (0,0,255),4)
     return frame
 
-def mouse_callback(event, x, y, flags, param):
-    global ix, iy, drawing, rois
+def draw_exit_button(frame):
+    x,y,w,h=EXIT_BTN
+    cv2.rectangle(frame,(x,y),(x+w,y+h),(50,50,50),-1)
+    cv2.rectangle(frame,(x,y),(x+w,y+h),(255,255,255),2)
+    cv2.putText(frame,"EXIT",(x+20,y+30),0,0.7,(255,255,255),2)
 
-    if event == cv2.EVENT_LBUTTONDOWN:
-        drawing = True
-        ix, iy = x, y
+def mouse_callback(event,x,y,flags,param):
+    global ix,iy,drawing,rois,exit_requested
 
-    elif event == cv2.EVENT_LBUTTONUP:
-        drawing = False
+    # scale back to original image coords
+    scale_x = 1920/(DISPLAY_WIDTH-PANEL_WIDTH)
+    scale_y = 1080/DISPLAY_HEIGHT
 
-        x1, y1 = ix, iy
-        x2, y2 = x, y
+    if event==cv2.EVENT_LBUTTONDOWN:
 
-        x_min, x_max = min(x1, x2), max(x1, x2)
-        y_min, y_max = min(y1, y2), max(y1, y2)
-
-        w = x_max - x_min
-        h = y_max - y_min
-
-        if w < 10 or h < 10:
+        bx,by,bw,bh=EXIT_BTN
+        if bx<=x<=bx+bw and by<=y<=by+bh:
+            exit_requested=True
             return
 
-        if len(rois) < 8:
-            rois.append((x_min, y_min, w, h))
+        drawing=True
+        ix=int(x*scale_x)
+        iy=int(y*scale_y)
 
-def save_rois():
-    with open(SAVE_FILE, "w") as f:
-        json.dump(rois, f)
+    elif event==cv2.EVENT_LBUTTONUP:
+        drawing=False
 
+        x2=int(x*scale_x)
+        y2=int(y*scale_y)
+
+        x_min,x_max=min(ix,x2),max(ix,x2)
+        y_min,y_max=min(iy,y2),max(iy,y2)
+
+        if x_max-x_min>10 and y_max-y_min>10 and len(rois)<8:
+            rois.append((x_min,y_min,x_max-x_min,y_max-y_min))
+
+def save_rois(): json.dump(rois,open(SAVE_FILE,"w"))
 def load_rois():
     global rois
-    try:
-        with open(SAVE_FILE, "r") as f:
-            rois = json.load(f)
-    except:
-        pass
+    try: rois=json.load(open(SAVE_FILE))
+    except: pass
 
-cv2.namedWindow("Camera")
+cv2.namedWindow("Camera", cv2.WND_PROP_FULLSCREEN)
+cv2.setWindowProperty("Camera", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 cv2.setMouseCallback("Camera", mouse_callback)
 
-# --- Main loop ---
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    ret,frame=cap.read()
+    if not ret: break
 
-    display = frame.copy()
+    display = cv2.resize(frame,(DISPLAY_WIDTH-PANEL_WIDTH,DISPLAY_HEIGHT))
 
-    results = draw_rois(display)
+    results = draw_rois(display, frame)
+    display=draw_pass_fail(display,results)
+    display=draw_status_panel(display,results)
 
-    display = draw_pass_fail(display, results)
-    display = draw_status_panel(display, results)
+    draw_exit_button(display)
 
-    # Freeze effect after save
-    if time.time() < freeze_until:
-        overlay = display.copy()
-        cv2.putText(overlay, "SAVED", (200, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0,255,255), 4)
-        display = overlay
+    if time.time()<freeze_until:
+        cv2.putText(display,"SAVED",(200,100),0,2,(0,255,255),4)
 
-    cv2.imshow("Camera", display)
+    cv2.imshow("Camera",display)
 
-    key = cv2.waitKey(1) & 0xFF
+    key=cv2.waitKey(1)&0xFF
 
-    if key == 27:
-        break
-
-    elif key == ord('c'):
-        rois = []
-
-    elif key == ord('s'):
-        save_rois()
-
-    elif key == ord('l'):
-        load_rois()
-
-    elif key == ord('w'):
-        if len(results) == 8:
-            save_results(results)
-
-    elif key == ord('n'):
-        cap.release()
-        camera_index += 1
-        cap = open_camera(camera_index)
-
-    elif key == ord('p'):
-        cap.release()
-        camera_index = max(0, camera_index - 1)
-        cap = open_camera(camera_index)
+    if key==27 or exit_requested: break
+    elif key==ord('c'): rois=[]
+    elif key==ord('s'): save_rois()
+    elif key==ord('l'): load_rois()
+    elif key==ord('w') and len(results)==8: save_results(results)
+    elif key==ord('n'):
+        cap.release(); camera_index+=1; cap=open_camera(camera_index)
+    elif key==ord('p'):
+        cap.release(); camera_index=max(0,camera_index-1); cap=open_camera(camera_index)
 
 cap.release()
 cv2.destroyAllWindows()
