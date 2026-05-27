@@ -2,7 +2,7 @@
 
 A colour-based vision inspection system running on a Raspberry Pi, designed to work alongside a UR5 collaborative robot. The camera analyses up to 8 regions of interest (ROIs) on a part and classifies each one as GOOD (blue) or BAD (red). Results are sent back to the UR5 via GPIO digital outputs.
 
-mistakes apear
+mistakes may apear
 AI Tools Ware used to aid in programing and structure
 ---
 
