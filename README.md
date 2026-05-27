@@ -25,7 +25,7 @@ RPi GPIO 27 → UR5 Digital Input 2  (ROI 2 result)
 RPi GPIO 22 → UR5 Digital Input 3  (ROI 3 result)
 RPi GPIO 23 → UR5 Digital Input 4  (ROI 4 result)
 RPi GPIO 24 → UR5 Digital Input 5  (ROI 5 result)
-RPi GPIO 25 → UR5 Digital Input 6  (ROI 6 result)
+RPi GPIO  6 → UR5 Digital Input 6  (ROI 6 result)
 RPi GPIO  5 → UR5 Digital Input 7  (ROI 7 result)
 ```
 
