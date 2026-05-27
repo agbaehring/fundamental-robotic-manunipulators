@@ -1,0 +1,340 @@
+def vision_battery__BMW_244():
+  set_tool_voltage(0)
+  set_tcp(p[0.0,0.0,0.1,0.0,0.0,0.0])
+  set_payload(0.35)
+  set_safety_mode_transition_hardness(1)
+  step_count_81bede3a_b84e_468f_8b96_528b283b7faf = 0.0
+  thread Step_Counter_Thread_536f0065_18bf_40ff_8c38_f21674b4aeab():
+    while (True):
+      step_count_81bede3a_b84e_468f_8b96_528b283b7faf = step_count_81bede3a_b84e_468f_8b96_528b283b7faf + 1.0
+      sync()
+    end
+  end
+  run Step_Counter_Thread_536f0065_18bf_40ff_8c38_f21674b4aeab()
+  set_standard_analog_input_domain(0, 1)
+  set_standard_analog_input_domain(1, 1)
+  set_tool_analog_input_domain(0, 1)
+  set_tool_analog_input_domain(1, 1)
+  set_analog_outputdomain(0, 0)
+  set_analog_outputdomain(1, 0)
+  set_input_actions_to_default()
+  set_gravity([0.0, 0.0, 9.82])
+  # begin: URCap Installation Node
+  #   Source: External Control, 1.0.5, FZI Research Center for Information Technology
+  #   Type: External Control
+  # end: URCap Installation Node
+  $ 1 "Robot Program"
+  $ 2 "Script: battery_module_cell.script"
+  # ================================================================
+  #  UR5 - Industrial Battery Module Replacement Cell
+  #  Oversat fra RoboDK Python script til URScript
+  # ----------------------------------------------------------------
+  #  VIGTIGT:
+  #   - Alle laengder er i METER (ikke mm som i RoboDK)
+  #   - Alle vinkler er i RADIANER (ikke grader)
+  #   - Griber styres via DO4 (open) og DO5 (close) paa controlleren
+  #   - Vision toggles via DO0
+  #   - Modul-input laeses fra DI0..DI7
+  #   - TCP og base-frame skal vaere kalibreret korrekt i PolyScope
+  #     foer dette script koeres paa den fysiske robot.
+  # ================================================================
+  
+  def battery_program():
+  
+    # -----------------------------------------------------------
+    # HASTIGHEDER OG ACCELERATIONER
+    # -----------------------------------------------------------
+    # MoveL hastighed (svarende til 300 mm/s i originalen)
+    global v_lin   = 0.3        # m/s
+  
+    # Acceleration (svarende til 750 mm/s^2 i originalen)
+    global a_lin   = 0.75       # m/s^2
+  
+    # MoveJ hastighed
+    # Originalen satte 300 deg/s = 5.24 rad/s, men UR5 maks er
+    # ca. pi rad/s (~180 deg/s). Vi capper paa 3.14 rad/s.
+    global v_joint = 3.14       # rad/s
+    global a_joint = 1.4        # rad/s^2
+  
+    # -----------------------------------------------------------
+    # HOEJDER (alle i meter)
+    # -----------------------------------------------------------
+    # Hoejde til modulet i batteriet
+    global Hojde_Modul_Batteri   = 0.039
+  
+    # Hoejde til Lid paa batteriet
+    global Hojde_For_Lid_Batteri = 0.045
+  
+    # Hoejde til Lid paa bordet
+    global Hojde_For_Lid_Bord    = 0.049
+  
+    # Hoejde for modul paa bordet
+    global Hojde_For_Modul_Bord  = 0.045
+  
+    # Sikkerhedshoejde (hop-hoejde mellem targets)
+    global Sikkerheds_Z          = 0.100
+  
+    # -----------------------------------------------------------
+    # PLADE-FRAME (svarer til plate_frame i RoboDK)
+    # Roteret pi/4 omkring Z.
+    # Alle targets defineres i denne frame og transformeres
+    # ind i base-frame via pose_trans() i make_target().
+    # -----------------------------------------------------------
+    global plate_frame = p[0, 0, 0, 0, 0, 3.141592653589793 / 4]
+  
+    # -----------------------------------------------------------
+    # ORIENTERINGS-POSES (kun rotation, ingen translation)
+    # -----------------------------------------------------------
+    # rotx(pi) * rotz(-pi/2)
+    #   -> vaerktoejet peger ned, X/Y aksen roteret -90 deg
+    global rot_down_rot = pose_trans(
+        p[0, 0, 0, 3.141592653589793, 0, 0],
+        p[0, 0, 0, 0, 0, -3.141592653589793/2])
+  
+    # rotx(pi)
+    #   -> vaerktoejet peger ned, ingen ekstra rotation
+    global rot_down = p[0, 0, 0, 3.141592653589793, 0, 0]
+  
+    # rotx(pi) * rotz(-pi/2) * roty(-pi/4)
+    #   -> til afhentning af gode moduler med 45 deg tilt
+    global rot_pickup = pose_trans(
+        rot_down_rot,
+        p[0, 0, 0, 0, -3.141592653589793/4, 0])
+  
+    # ===========================================================
+    # FUNKTIONER
+    # ===========================================================
+  
+    # -----------------------------------------------------------
+    # Hjaelpefunktion: byg en target-pose i plate_frame
+    # x, y, z i meter; rot_pose er en p[] med kun rotation
+    # -----------------------------------------------------------
+    def make_target(x, y, z, rot_pose):
+      local_pose = p[x, y, z, rot_pose[3], rot_pose[4], rot_pose[5]]
+      return pose_trans(plate_frame, local_pose)
+    end
+  
+    # -----------------------------------------------------------
+    # GRIBER STYRING (Robotiq 2F-85 via controller DO)
+    #   DO4 = open  |  DO5 = close
+    # Hvis du bruger Robotiq URCap kan du i stedet kalde
+    # rq_open() / rq_close() her.
+    # -----------------------------------------------------------
+    def Open_Griber():
+      set_digital_out(5, False)
+      set_digital_out(4, True)
+      sleep(0.5)
+    end
+  
+    def Close_Griber():
+      set_digital_out(4, False)
+      set_digital_out(5, True)
+      sleep(0.5)
+    end
+  
+    # -----------------------------------------------------------
+    # UDREGNING AF MODULPOSITION
+    # Beregner over- og ned-pose for et givet modul i batteriet
+    # Modul 1..4 = kolonne 0, Modul 5..8 = kolonne 1
+    # Returnerer [target_over, target_ned]
+    # -----------------------------------------------------------
+    def Udregning_af_Modul(Modul):
+      if Modul > 4:
+        offsetx = 0.0715
+        offsety = 0.047
+        kol1 = offsetx
+  
+        if Modul == 5:
+          i = 4
+        elif Modul == 6:
+          i = 3
+        elif Modul == 7:
+          i = 2
+        else:
+          # Modul == 8
+          i = 1
+        end
+  
+        kol2 = offsety * i
+      else:
+        offsety = 0.047
+        kol1 = 0
+        kol2 = offsety * Modul
+      end
+  
+      x = -0.213 - kol1
+      y = -0.207 - kol2
+  
+      t1 = make_target(x, y, Sikkerheds_Z,        rot_down_rot)
+      t2 = make_target(x, y, Hojde_Modul_Batteri, rot_down_rot)
+  
+      return [t1, t2]
+    end
+  
+    # -----------------------------------------------------------
+    # LAES HVILKE MODULER DER SKAL SKIFTES (fra DI 0..7)
+    # Hvis DI(n) = high  ->  modul (n+1) skal skiftes
+    # Returnerer liste K af modul-numre (1..8)
+    # -----------------------------------------------------------
+    def Laes_Moduler_Fra_DI():
+      global  K_modules = [0, 0, 0, 0, 0, 0, 0, 0]
+      global  K_count =0
+  
+      di_idx = 0
+      while di_idx < 8:
+        value = get_digital_in(di_idx)
+        textmsg("DI", di_idx)
+        if value == True:
+          K_modules[K_count] = di_idx + 1
+          global K_count = K_count +1
+        end
+        di_idx = di_idx + 1
+      end
+    end
+  
+    # -----------------------------------------------------------
+    # PICK LID  (aabn griber, koer ned, luk griber, koer op)
+    # -----------------------------------------------------------
+    def Pick_lid(above, down):
+      Open_Griber()
+      movej(above, a=a_joint, v=v_joint)
+      movel(down,  a=a_lin,   v=v_lin)
+      Close_Griber()
+      movel(above, a=a_lin,   v=v_lin)
+    end
+  
+    # -----------------------------------------------------------
+    # PLACE LID (koer ned, aabn griber, koer op)
+    # -----------------------------------------------------------
+    def Place_lid(above, down):
+      movej(above, a=a_joint, v=v_joint)
+      movel(down,  a=a_lin,   v=v_lin)
+      Open_Griber()
+      movel(above, a=a_lin,   v=v_lin)
+    end
+  
+    # -----------------------------------------------------------
+    # MODUL PLACERING
+    # Stil = 0  ->  hent modul   (luk griber)
+    # Stil = 1  ->  placer modul (aabn griber)
+    # -----------------------------------------------------------
+    def Modul_placering(Modul, Stil):
+      targets = Udregning_af_Modul(Modul)
+      t1 = targets[0]
+      t2 = targets[1]
+  
+      movej(t1, a=a_joint, v=v_joint)
+      movel(t2, a=a_lin,   v=v_lin)
+  
+      if Stil == 0:
+        Close_Griber()
+      else:
+        Open_Griber()
+      end
+  
+      movel(t1, a=a_lin, v=v_lin)
+    end
+  
+    # -----------------------------------------------------------
+    # AFLEVER DAARLIGT MODUL (paa bordet ved target4/5)
+    # -----------------------------------------------------------
+    def Aflevere_Moduler():
+      movej(target4, a=a_joint, v=v_joint)
+      movel(target5, a=a_lin,   v=v_lin)
+      Open_Griber()
+      movej(target4, a=a_joint, v=v_joint)
+    end
+  
+    # -----------------------------------------------------------
+    # AFHENTNING AF GODT MODUL
+    # Bruger aktuel TCP-pose og gaar 97 mm ned i vaerktoejs-Z
+    # -----------------------------------------------------------
+    def Afhentning_Af_Gode_Moduler():
+      movej(target6, a=a_joint, v=v_joint)
+  
+      pose_top  = get_actual_tcp_pose()
+      pose_down = pose_trans(pose_top, p[0, 0, 0.065, 0, 0, 0])
+  
+      movel(pose_down, a=a_lin, v=v_lin)
+  
+      Close_Griber()
+  
+      movel(pose_top,  a=a_lin, v=v_lin)
+    end
+  
+    # ===========================================================
+    # FASTE TARGETS (defineres efter make_target er defineret)
+    # ===========================================================
+  
+    # Aflevering af daarlige moduler
+    global target4  = make_target(-0.400, -0.325, Sikkerheds_Z,         rot_down_rot)
+    global target5  = make_target(-0.400, -0.325, Hojde_For_Modul_Bord, rot_down_rot)
+  
+    # Afhentning af gode moduler (med -45 deg tilt)
+    global target6  = make_target(-0.067, -0.289, 0.090,                rot_pickup)
+  
+    # Opsamling af laag fra batteriet
+    global target11 = make_target(-0.2467, -0.324, Sikkerheds_Z,          rot_down)
+    global target12 = make_target(-0.2467, -0.324, Hojde_For_Lid_Batteri, rot_down)
+  
+    # Placering af laag paa bordet
+    global target13 = make_target(-0.2617, -0.049, Sikkerheds_Z,        rot_down)
+    global target14 = make_target(-0.2617, -0.049, Hojde_For_Lid_Bord,  rot_down)
+  
+    # ===========================================================
+    # HOVED PROGRAM
+    # ===========================================================
+  
+    # Start position - svarer til [90, -90, 90, 90, 90, 0] grader
+    home_q = [d2r(90), d2r(-90), d2r(90), d2r(90), d2r(90), 0]
+    movej(home_q, a=a_joint, v=v_joint)
+  
+    # 1) Fjern laaget fra batteriet
+    Pick_lid(target11, target12)
+  
+    # 2) Placer laaget paa bordet
+    Place_lid(target13, target14)
+  
+    # 3) Giv besked til vision via DO0
+    set_digital_out(0, True)
+    sleep(0.5)
+  
+    # 4) Laes hvilke moduler der skal skiftes
+    Laes_Moduler_Fra_DI()
+  
+    # 5) Sluk besked til vision
+    set_digital_out(0, False)
+  
+    # 6) Fjern daarlige moduler en ad gangen
+    J = 0
+    while J < K_count:
+      Modul = K_modules[J]
+      J = J + 1
+      Modul_placering(Modul, 0)   # luk griber  -> hent
+      Aflevere_Moduler()
+    end
+  
+    # 7) Hent gode moduler og placer dem i batteriet
+    J = 0
+    while J < K_count:
+      Afhentning_Af_Gode_Moduler()
+      Modul = K_modules[J]
+      Modul_placering(Modul, 1)   # aabn griber -> placer
+      J = J + 1
+    end
+  
+    # 8) Hent laaget tilbage fra bordet
+    Pick_lid(target13, target14)
+  
+    # 9) Placer laaget tilbage paa batteriet
+    Place_lid(target11, target12)
+  
+    # 10) Tilbage til start position
+    movej(home_q, a=a_joint, v=v_joint)
+  
+    textmsg("Battery module replacement finished")
+  end
+  
+  # Koer programmet
+  battery_program()
+end
